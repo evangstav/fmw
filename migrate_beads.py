@@ -24,7 +24,41 @@ STATUS = {
 }
 
 
-def convert_issue(d: dict, type_of: dict, parent_map: dict) -> dict:
+def load_people(path: str) -> dict:
+    """Build a lowercased alias -> canonical engineer id map from people.yaml."""
+    import yaml  # stdlib-free elsewhere; only needed when --people is passed
+    data = yaml.safe_load(open(path)) or {}
+    amap = {}
+    for e in data.get("engineers", []):
+        eid = e.get("id")
+        if not eid:
+            continue
+        amap[eid.lower()] = eid
+        if e.get("name"):
+            amap[e["name"].lower()] = eid
+        al = e.get("aliases") or {}
+        for key in ("beads", "git_emails", "scratchpad"):
+            for v in al.get(key) or []:
+                amap[str(v).lower()] = eid
+    return amap
+
+
+def resolve_owner(owner, amap: dict):
+    """Map a beads owner (git email / handle / name) to a canonical engineer id.
+
+    Unknown email-shaped owners (bots, or a real person not yet in people.yaml) become
+    None (unassigned) rather than littering an email into assignee; unknown handles are
+    kept raw so a missing person is still visible.
+    """
+    if not owner:
+        return None
+    key = str(owner).lower()
+    if key in amap:
+        return amap[key]
+    return None if "@" in key else owner
+
+
+def convert_issue(d: dict, type_of: dict, parent_map: dict, amap: dict) -> dict:
     blocked_by = []
     self_is_epic = type_of.get(d["id"]) == "epic"
     for dep in d.get("dependencies") or []:
@@ -50,7 +84,7 @@ def convert_issue(d: dict, type_of: dict, parent_map: dict) -> dict:
         "parent": parent,
         "blocked_by": sorted(set(blocked_by)),
         "repo": None,
-        "assignee": d.get("owner") or None,
+        "assignee": resolve_owner(d.get("owner"), amap),
         "labels": list(d.get("labels") or []),
         "body": d.get("description") or "",
         "created_at": d.get("created_at"),
@@ -66,7 +100,10 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--src", help="source JSONL (default <project_dir>/.beads/issues.jsonl); "
                     "pass a fresh `bd export` to avoid stale-export drift")
+    ap.add_argument("--people", help="people.yaml to resolve owner -> canonical assignee id")
     args = ap.parse_args()
+
+    amap = load_people(args.people) if args.people else {}
 
     src = args.src or os.path.join(args.project_dir, ".beads", "issues.jsonl")
     if not os.path.exists(src):
@@ -102,7 +139,7 @@ def main():
     n = done = 0
     with open(dst, "w") as fout:
         for d in beads:
-            issue = convert_issue(d, type_of, parent_map)
+            issue = convert_issue(d, type_of, parent_map, amap)
             if not issue["project"]:
                 issue["project"] = project
             fout.write(json.dumps(issue, ensure_ascii=False) + "\n")
