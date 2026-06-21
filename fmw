@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+"""fmw — minimal dependency-aware work store.
+
+One JSONL file per project (`<project>/.work/issues.jsonl`), no daemon, no server.
+Keeps the only two relationships that proved load-bearing in practice: `parent` (epics)
+and `blocked_by` (ordering), plus a `ready = open AND all blockers done` computation.
+
+See docs/plans/minimal-work-store-spec.md for the rationale.
+"""
+import argparse
+import json
+import os
+import random
+import string
+import sys
+from datetime import datetime, timezone
+
+STATUSES = ["open", "in_progress", "done", "deferred"]
+OPEN_STATES = {"open", "in_progress", "deferred"}
+TYPES = ["task", "bug", "feature", "epic", "chore"]
+B36 = string.digits + string.ascii_lowercase
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------- store resolution
+def resolve_store(args) -> str:
+    """Locate the .work/issues.jsonl store, in priority order."""
+    if getattr(args, "store", None):
+        return args.store
+    if os.environ.get("FMW_STORE"):
+        return os.environ["FMW_STORE"]
+    if getattr(args, "project", None):
+        root = getattr(args, "root", None) or os.environ.get(
+            "FMW_ROOT", os.path.expanduser("~/workspace")
+        )
+        return os.path.join(root, args.project, ".work", "issues.jsonl")
+    # walk up from cwd looking for an existing store
+    d = os.getcwd()
+    while True:
+        cand = os.path.join(d, ".work", "issues.jsonl")
+        if os.path.exists(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return os.path.join(os.getcwd(), ".work", "issues.jsonl")
+
+
+def project_of(store: str) -> str:
+    """Infer the project slug from the store path: <slug>/.work/issues.jsonl."""
+    work = os.path.dirname(os.path.abspath(store))
+    return os.path.basename(os.path.dirname(work))
+
+
+def load(store: str) -> list:
+    if not os.path.exists(store):
+        return []
+    out = []
+    with open(store) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+def save(store: str, issues: list) -> None:
+    os.makedirs(os.path.dirname(store), exist_ok=True)
+    tmp = store + ".tmp"
+    with open(tmp, "w") as f:
+        for i in issues:
+            f.write(json.dumps(i, ensure_ascii=False) + "\n")
+    os.replace(tmp, store)
+
+
+def gen_id(project: str, existing: set) -> str:
+    while True:
+        suffix = "".join(random.choice(B36) for _ in range(3))
+        cand = f"{project}-{suffix}"
+        if cand not in existing:
+            return cand
+
+
+# ---------------------------------------------------------------- core logic
+def index(issues: list) -> dict:
+    return {i["id"]: i for i in issues}
+
+
+def is_done(issue) -> bool:
+    return issue is not None and issue.get("status") == "done"
+
+
+def blockers_of(issue, by_id) -> list:
+    """Return the still-open blocker ids (missing ids count as satisfied)."""
+    open_blockers = []
+    for bid in issue.get("blocked_by", []):
+        b = by_id.get(bid)
+        if b is not None and not is_done(b):
+            open_blockers.append(bid)
+    return open_blockers
+
+
+def is_ready(issue, by_id) -> bool:
+    return issue.get("status") == "open" and not blockers_of(issue, by_id)
+
+
+def require(issues, id_) -> dict:
+    by_id = index(issues)
+    if id_ not in by_id:
+        die(f"no such issue: {id_}")
+    return by_id[id_]
+
+
+def die(msg: str, code: int = 1):
+    print(f"fmw: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------- rendering
+def fmt_issue_line(i, by_id) -> str:
+    flags = []
+    ob = blockers_of(i, by_id)
+    if ob:
+        flags.append("blocked-by:" + ",".join(ob))
+    if i.get("parent"):
+        flags.append("parent:" + i["parent"])
+    if i.get("assignee"):
+        flags.append("@" + i["assignee"])
+    tail = ("  (" + "; ".join(flags) + ")") if flags else ""
+    pri = i.get("priority")
+    pri_s = f"p{pri}" if pri is not None else "p?"
+    st = i.get("status", "?")
+    return f"{i['id']:14} [{pri_s} {i.get('type','task')} {st}] {i.get('title','')}{tail}"
+
+
+def output(args, rows, items):
+    if getattr(args, "json", False):
+        print(json.dumps(items, ensure_ascii=False, indent=2))
+    else:
+        for r in rows:
+            print(r)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_create(args):
+    store = resolve_store(args)
+    issues = load(store)
+    project = args.project or project_of(store)
+    ids = {i["id"] for i in issues}
+    iid = gen_id(project, ids)
+    ts = now()
+    issue = {
+        "id": iid,
+        "project": project,
+        "title": args.title,
+        "status": "open",
+        "type": args.type,
+        "priority": args.priority,
+        "parent": args.parent,
+        "blocked_by": list(args.blocked_by or []),
+        "repo": args.repo,
+        "assignee": args.assignee,
+        "labels": list(args.label or []),
+        "body": args.body or "",
+        "created_at": ts,
+        "updated_at": ts,
+        "closed_at": None,
+        "close_reason": None,
+    }
+    issues.append(issue)
+    save(store, issues)
+    if getattr(args, "json", False):
+        print(json.dumps(issue, ensure_ascii=False))
+    else:
+        print(iid)
+
+
+def cmd_list(args):
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    sel = issues
+    if args.status:
+        sel = [i for i in sel if i.get("status") == args.status]
+    if args.parent:
+        sel = [i for i in sel if i.get("parent") == args.parent]
+    if args.label:
+        sel = [i for i in sel if args.label in (i.get("labels") or [])]
+    if args.assignee:
+        sel = [i for i in sel if i.get("assignee") == args.assignee]
+    sel.sort(key=lambda i: (i.get("priority", 9), i.get("status", "")))
+    output(args, [fmt_issue_line(i, by_id) for i in sel], sel)
+
+
+def cmd_ready(args):
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    sel = [i for i in issues if is_ready(i, by_id)]
+    if args.assignee:
+        sel = [i for i in sel if i.get("assignee") == args.assignee]
+    if args.repo:
+        sel = [i for i in sel if i.get("repo") == args.repo]
+    sel.sort(key=lambda i: i.get("priority", 9))
+    output(args, [fmt_issue_line(i, by_id) for i in sel], sel)
+
+
+def cmd_blocked(args):
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    sel = [
+        i
+        for i in issues
+        if i.get("status") in OPEN_STATES and blockers_of(i, by_id)
+    ]
+    sel.sort(key=lambda i: i.get("priority", 9))
+    output(args, [fmt_issue_line(i, by_id) for i in sel], sel)
+
+
+def cmd_show(args):
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    i = require(issues, args.id)
+    if getattr(args, "json", False):
+        print(json.dumps(i, ensure_ascii=False, indent=2))
+        return
+    print(fmt_issue_line(i, by_id))
+    if i.get("body"):
+        print("\n" + i["body"])
+    children = [c for c in issues if c.get("parent") == i["id"]]
+    if children:
+        done = sum(1 for c in children if c.get("status") == "done")
+        print(f"\nchildren ({done}/{len(children)} done):")
+        for c in children:
+            print("  " + fmt_issue_line(c, by_id))
+
+
+def cmd_epic(args):
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    epic = require(issues, args.id)
+    children = [c for c in issues if c.get("parent") == epic["id"]]
+    done = sum(1 for c in children if c.get("status") == "done")
+    if getattr(args, "json", False):
+        print(json.dumps({"epic": epic, "done": done, "total": len(children),
+                          "children": children}, ensure_ascii=False, indent=2))
+        return
+    print(fmt_issue_line(epic, by_id))
+    print(f"  rollup: {done}/{len(children)} done")
+    for c in sorted(children, key=lambda x: (x.get("priority", 9), x.get("status", ""))):
+        print("  " + fmt_issue_line(c, by_id))
+
+
+def cmd_update(args):
+    store = resolve_store(args)
+    issues = load(store)
+    i = require(issues, args.id)
+    if args.status:
+        if args.status not in STATUSES:
+            die(f"bad status {args.status}; one of {STATUSES}")
+        i["status"] = args.status
+        if args.status == "done" and not i.get("closed_at"):
+            i["closed_at"] = now()
+    if args.priority is not None:
+        i["priority"] = args.priority
+    if args.assignee is not None:
+        i["assignee"] = args.assignee or None
+    if args.parent is not None:
+        i["parent"] = args.parent or None
+    if args.title:
+        i["title"] = args.title
+    bb = set(i.get("blocked_by", []))
+    for b in args.add_block or []:
+        bb.add(b)
+    for b in args.rm_block or []:
+        bb.discard(b)
+    i["blocked_by"] = sorted(bb)
+    labels = set(i.get("labels", []))
+    for ll in args.add_label or []:
+        labels.add(ll)
+    for ll in args.rm_label or []:
+        labels.discard(ll)
+    i["labels"] = sorted(labels)
+    i["updated_at"] = now()
+    save(store, issues)
+    print(f"updated {i['id']}")
+
+
+def cmd_close(args):
+    store = resolve_store(args)
+    issues = load(store)
+    i = require(issues, args.id)
+    i["status"] = "done"
+    i["closed_at"] = now()
+    i["updated_at"] = i["closed_at"]
+    i["close_reason"] = args.reason
+    save(store, issues)
+    print(f"closed {i['id']}")
+
+
+def cmd_link(args):
+    store = resolve_store(args)
+    issues = load(store)
+    i = require(issues, args.id)
+    if args.blocked_by:
+        bb = set(i.get("blocked_by", []))
+        bb.add(args.blocked_by)
+        i["blocked_by"] = sorted(bb)
+    if args.parent:
+        i["parent"] = args.parent
+    i["updated_at"] = now()
+    save(store, issues)
+    print(f"linked {i['id']}")
+
+
+# ---------------------------------------------------------------- arg parsing
+def build_parser():
+    p = argparse.ArgumentParser(prog="fmw", description="minimal dependency-aware work store")
+    # global store-resolution flags (also accepted post-subcommand)
+    def add_store(sp):
+        sp.add_argument("--store", help="path to .work/issues.jsonl")
+        sp.add_argument("--project", help="project slug (resolves <root>/<project>/.work/issues.jsonl)")
+        sp.add_argument("--root", help="workspace root (default ~/workspace or $FMW_ROOT)")
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("create", help="create an issue")
+    add_store(c)
+    c.add_argument("title")
+    c.add_argument("--type", default="task", choices=TYPES)
+    c.add_argument("-p", "--priority", type=int, default=2)
+    c.add_argument("--parent")
+    c.add_argument("--repo")
+    c.add_argument("--assignee")
+    c.add_argument("--label", action="append")
+    c.add_argument("--blocked-by", action="append", dest="blocked_by")
+    c.add_argument("--body")
+    c.set_defaults(fn=cmd_create)
+
+    c = sub.add_parser("list", help="list issues")
+    add_store(c)
+    c.add_argument("--status", choices=STATUSES)
+    c.add_argument("--parent")
+    c.add_argument("--label")
+    c.add_argument("--assignee")
+    c.set_defaults(fn=cmd_list)
+
+    c = sub.add_parser("ready", help="dispatchable issues (open, no open blocker)")
+    add_store(c)
+    c.add_argument("--assignee")
+    c.add_argument("--repo")
+    c.set_defaults(fn=cmd_ready)
+
+    c = sub.add_parser("blocked", help="open issues with an open blocker")
+    add_store(c)
+    c.set_defaults(fn=cmd_blocked)
+
+    c = sub.add_parser("show", help="show an issue + children")
+    add_store(c)
+    c.add_argument("id")
+    c.set_defaults(fn=cmd_show)
+
+    c = sub.add_parser("epic", help="show an epic and its children with rollup")
+    add_store(c)
+    c.add_argument("id")
+    c.set_defaults(fn=cmd_epic)
+
+    c = sub.add_parser("update", help="update an issue")
+    add_store(c)
+    c.add_argument("id")
+    c.add_argument("--status", choices=STATUSES)
+    c.add_argument("-p", "--priority", type=int)
+    c.add_argument("--assignee")
+    c.add_argument("--parent")
+    c.add_argument("--title")
+    c.add_argument("--add-block", action="append", dest="add_block")
+    c.add_argument("--rm-block", action="append", dest="rm_block")
+    c.add_argument("--add-label", action="append", dest="add_label")
+    c.add_argument("--rm-label", action="append", dest="rm_label")
+    c.set_defaults(fn=cmd_update)
+
+    c = sub.add_parser("close", help="close an issue (status=done)")
+    add_store(c)
+    c.add_argument("id")
+    c.add_argument("--reason")
+    c.set_defaults(fn=cmd_close)
+
+    c = sub.add_parser("link", help="add a parent or blocked-by edge")
+    add_store(c)
+    c.add_argument("id")
+    c.add_argument("--blocked-by")
+    c.add_argument("--parent")
+    c.set_defaults(fn=cmd_link)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
