@@ -343,6 +343,8 @@ def cmd_update(args):
         i["assignee"] = args.assignee or None
     if args.parent is not None:
         i["parent"] = args.parent or None
+    if args.repo is not None:
+        i["repo"] = args.repo or None
     if args.title:
         i["title"] = args.title
     bb = set(i.get("blocked_by", []))
@@ -453,6 +455,7 @@ def build_parser():
     c.add_argument("-p", "--priority", type=int)
     c.add_argument("--assignee")
     c.add_argument("--parent")
+    c.add_argument("--repo")
     c.add_argument("--title")
     c.add_argument("--add-block", action="append", dest="add_block")
     c.add_argument("--rm-block", action="append", dest="rm_block")
