@@ -258,6 +258,75 @@ def cmd_epic(args):
         print("  " + fmt_issue_line(c, by_id))
 
 
+def cmd_board(args):
+    """Render a readable markdown projection of a project's work."""
+    store = resolve_store(args)
+    issues = load(store)
+    by_id = index(issues)
+    project = (issues[0]["project"] if issues else None) or project_of(store)
+
+    def title_of(i):
+        return f"`{i['id']}` p{i.get('priority','?')} {i.get('type','task')} — {i.get('title','')}"
+
+    ready = [i for i in issues if is_ready(i, by_id) and i.get("type") != "epic"]
+    inprog = [i for i in issues if i.get("status") == "in_progress"]
+    blocked = [
+        i for i in issues
+        if i.get("status") in OPEN_STATES and i.get("type") != "epic"
+        and blockers_of(i, by_id)
+    ]
+    onhold = [i for i in issues if i.get("status") in ("deferred", "blocked")]
+    epics = [i for i in issues if i.get("type") == "epic"]
+    done = sum(1 for i in issues if i.get("status") == "done")
+    openn = sum(1 for i in issues if i.get("status") != "done")
+
+    out = []
+    out.append(f"# {project} — work board")
+    out.append("")
+    out.append(
+        f"_{openn} open · {len(ready)} ready · {len(blocked)} blocked · "
+        f"{len(inprog)} in-progress · {done} done · {len(issues)} total_"
+    )
+
+    def section(name, items, blockers=False):
+        if not items:
+            return
+        items.sort(key=lambda i: (i.get("priority", 9), i.get("title", "")))
+        out.append("")
+        out.append(f"## {name} ({len(items)})")
+        for i in items:
+            line = f"- {title_of(i)}"
+            if i.get("assignee"):
+                line += f"  @{i['assignee']}"
+            if blockers:
+                ob = blockers_of(i, by_id)
+                names = ", ".join(
+                    f"{b} ({by_id[b]['title'][:32]})" if b in by_id else b for b in ob
+                )
+                line += f"  ← {names}"
+            out.append(line)
+
+    section("▶ Ready", ready)
+    section("⏳ In progress", inprog)
+    section("⛔ Blocked", blocked, blockers=True)
+
+    open_epics = [e for e in epics if e.get("status") != "done"]
+    if open_epics:
+        out.append("")
+        out.append(f"## 🗂 Epics ({len(open_epics)})")
+        for e in sorted(open_epics, key=lambda i: i.get("priority", 9)):
+            kids = [c for c in issues if c.get("parent") == e["id"]]
+            kdone = sum(1 for c in kids if c.get("status") == "done")
+            out.append(f"- **{e['id']}** {e.get('title','')} — {kdone}/{len(kids)} done")
+            for c in sorted(kids, key=lambda i: (i.get("status", ""), i.get("priority", 9))):
+                mark = "x" if c.get("status") == "done" else " "
+                out.append(f"  - [{mark}] `{c['id']}` {c.get('title','')} ({c.get('status')})")
+
+    section("💤 Deferred / on hold", onhold)
+    out.append("")
+    print("\n".join(out))
+
+
 def cmd_update(args):
     store = resolve_store(args)
     issues = load(store)
@@ -372,6 +441,10 @@ def build_parser():
     add_store(c)
     c.add_argument("id")
     c.set_defaults(fn=cmd_epic)
+
+    c = sub.add_parser("board", help="readable markdown projection of the project")
+    add_store(c)
+    c.set_defaults(fn=cmd_board)
 
     c = sub.add_parser("update", help="update an issue")
     add_store(c)
