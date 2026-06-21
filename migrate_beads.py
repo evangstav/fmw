@@ -20,22 +20,26 @@ STATUS = {
     "in_progress": "in_progress",
     "closed": "done",
     "deferred": "deferred",
-    "blocked": "open",  # fmw has no "blocked" status; the blocked_by edges express it
+    "blocked": "blocked",  # manual flag; excluded from ready (ready needs status==open)
 }
 
 
-def convert_issue(d: dict) -> dict:
-    parent = None
+def convert_issue(d: dict, type_of: dict, parent_map: dict) -> dict:
     blocked_by = []
+    self_is_epic = type_of.get(d["id"]) == "epic"
     for dep in d.get("dependencies") or []:
         t = dep.get("type")
         tgt = dep.get("depends_on_id")
         if not tgt:
             continue
-        if t == "parent-child":
-            parent = tgt
-        elif t == "blocks":
+        if t == "blocks":
             blocked_by.append(tgt)
+        elif t == "parent-child" and self_is_epic and type_of.get(tgt) != "epic":
+            # An epic is blocked by its non-epic children (taxis-style: epic depends_on a
+            # task/feature child). Two memberships do NOT block: a child depending on its
+            # parent epic, and a sub-epic depending on a super-epic (ethniki-style).
+            blocked_by.append(tgt)
+    parent = parent_map.get(d["id"])
     return {
         "id": d["id"],
         "project": d.get("project") or "",
@@ -47,7 +51,7 @@ def convert_issue(d: dict) -> dict:
         "blocked_by": sorted(set(blocked_by)),
         "repo": None,
         "assignee": d.get("owner") or None,
-        "labels": [],
+        "labels": list(d.get("labels") or []),
         "body": d.get("description") or "",
         "created_at": d.get("created_at"),
         "updated_at": d.get("updated_at"),
@@ -60,9 +64,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("project_dir")
     ap.add_argument("--out")
+    ap.add_argument("--src", help="source JSONL (default <project_dir>/.beads/issues.jsonl); "
+                    "pass a fresh `bd export` to avoid stale-export drift")
     args = ap.parse_args()
 
-    src = os.path.join(args.project_dir, ".beads", "issues.jsonl")
+    src = args.src or os.path.join(args.project_dir, ".beads", "issues.jsonl")
     if not os.path.exists(src):
         print(f"no beads export at {src}", file=sys.stderr)
         sys.exit(1)
@@ -71,14 +77,32 @@ def main():
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     project = os.path.basename(os.path.abspath(out_dir))
-    n = done = 0
-    with open(src) as fin, open(dst, "w") as fout:
+    beads = []
+    with open(src) as fin:
         for line in fin:
             line = line.strip()
-            if not line:
+            if line:
+                beads.append(json.loads(line))
+    type_of = {d["id"]: (d.get("issue_type") or d.get("type")) for d in beads}
+
+    # Global parent map: for each parent-child edge, the epic endpoint is the parent.
+    parent_map = {}
+    for d in beads:
+        for dep in d.get("dependencies") or []:
+            if dep.get("type") != "parent-child":
                 continue
-            d = json.loads(line)
-            issue = convert_issue(d)
+            a, b = d["id"], dep.get("depends_on_id")
+            if not b:
+                continue
+            if type_of.get(b) == "epic":
+                parent_map[a] = b
+            elif type_of.get(a) == "epic":
+                parent_map[b] = a
+
+    n = done = 0
+    with open(dst, "w") as fout:
+        for d in beads:
+            issue = convert_issue(d, type_of, parent_map)
             if not issue["project"]:
                 issue["project"] = project
             fout.write(json.dumps(issue, ensure_ascii=False) + "\n")

@@ -15,8 +15,8 @@ import string
 import sys
 from datetime import datetime, timezone
 
-STATUSES = ["open", "in_progress", "done", "deferred"]
-OPEN_STATES = {"open", "in_progress", "deferred"}
+STATUSES = ["open", "in_progress", "blocked", "done", "deferred"]
+OPEN_STATES = {"open", "in_progress", "blocked", "deferred"}
 TYPES = ["task", "bug", "feature", "epic", "chore"]
 B36 = string.digits + string.ascii_lowercase
 
