@@ -170,6 +170,7 @@ def cmd_create(args):
         "updated_at": ts,
         "closed_at": None,
         "close_reason": None,
+        "external": None,
     }
     issues.append(issue)
     save(store, issues)
@@ -345,6 +346,8 @@ def cmd_update(args):
         i["parent"] = args.parent or None
     if args.repo is not None:
         i["repo"] = args.repo or None
+    if args.external is not None:
+        i["external"] = args.external or None
     if args.title:
         i["title"] = args.title
     bb = set(i.get("blocked_by", []))
@@ -456,6 +459,7 @@ def build_parser():
     c.add_argument("--assignee")
     c.add_argument("--parent")
     c.add_argument("--repo")
+    c.add_argument("--external", help="URL/id of a mirrored external tracker item (ADO Boards / GitHub issue)")
     c.add_argument("--title")
     c.add_argument("--add-block", action="append", dest="add_block")
     c.add_argument("--rm-block", action="append", dest="rm_block")
